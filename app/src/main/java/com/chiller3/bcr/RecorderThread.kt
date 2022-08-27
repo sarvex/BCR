@@ -28,6 +28,7 @@ import java.time.format.DateTimeFormatterBuilder
 import java.time.format.DateTimeParseException
 import java.time.format.SignStyle
 import java.time.temporal.ChronoField
+import kotlin.math.min
 import android.os.Process as AndroidProcess
 
 /**
@@ -68,6 +69,13 @@ class RecorderThread(
     private val format: Format
     private val formatParam: UInt?
     private val sampleRate = SampleRate.fromPreferences(prefs)
+
+    // Sources
+    //private val sources = arrayOf(MediaRecorder.AudioSource.VOICE_CALL)
+    private val sources = arrayOf(
+        MediaRecorder.AudioSource.VOICE_UPLINK,
+        MediaRecorder.AudioSource.VOICE_DOWNLINK,
+    )
 
     init {
         Log.i(tag, "Created thread for call: $call")
@@ -388,7 +396,7 @@ class RecorderThread(
             ?: throw IOException("Failed to open file at ${file.uri}")
 
     /**
-     * Record from [MediaRecorder.AudioSource.VOICE_CALL] until [cancel] is called or an audio
+     * Record from [sources], with interleaving channels, until [cancel] is called or an audio
      * capture or encoding error occurs.
      *
      * [pfd] does not get closed by this method.
@@ -404,38 +412,49 @@ class RecorderThread(
         }
         Log.d(tag, "AudioRecord minimum buffer size: $minBufSize")
 
-        val audioRecord = AudioRecord(
-            MediaRecorder.AudioSource.VOICE_CALL,
-            sampleRate.value.toInt(),
-            CHANNEL_CONFIG,
-            ENCODING,
-            // On some devices, MediaCodec occasionally has sudden spikes in processing time, so use
-            // a larger internal buffer to reduce the chance of overrun on the recording side.
-            minBufSize * 6,
-        )
-        val initialBufSize = audioRecord.bufferSizeInFrames *
-                audioRecord.format.frameSizeInBytesCompat
-        Log.d(tag, "AudioRecord initial buffer size: $initialBufSize")
+        val audioRecords = ArrayList<AudioRecord>(sources.size)
 
-        Log.d(tag, "AudioRecord format: ${audioRecord.format}")
+        try {
+            sources.forEach {
+                val ar = AudioRecord(
+                    it,
+                    sampleRate.value.toInt(),
+                    CHANNEL_CONFIG,
+                    ENCODING,
+                    // On some devices, MediaCodec occasionally has sudden spikes in processing time, so
+                    // use a larger internal buffer to reduce the chance of overrun on the recording
+                    // side.
+                    minBufSize * 6,
+                )
+
+                Log.d(tag, "Created AudioRecord instance:")
+                Log.d(tag, "- Source: ${ar.audioSource}")
+                Log.d(tag, "- Initial buffer size in frames: ${ar.bufferSizeInFrames}")
+                Log.d(tag, "- Format: ${ar.format}")
+
+                audioRecords.add(ar)
+            }
+        } catch (e: Exception) {
+            audioRecords.forEach(AudioRecord::release)
+            throw e
+        }
 
         // Where's my RAII? :(
         try {
-            audioRecord.startRecording()
+            audioRecords.forEach(AudioRecord::startRecording)
 
             try {
                 val container = format.getContainer(pfd.fileDescriptor)
 
                 try {
-                    // audioRecord.format has the detected native sample rate
-                    val mediaFormat = format.getMediaFormat(audioRecord.format, formatParam)
+                    val mediaFormat = format.getMediaFormat(sources.size, sampleRate, formatParam)
                     val encoder = format.getEncoder(mediaFormat, container)
 
                     try {
                         encoder.start()
 
                         try {
-                            encodeLoop(audioRecord, encoder, minBufSize)
+                            encodeLoop(audioRecords, encoder, minBufSize)
                         } finally {
                             encoder.stop()
                         }
@@ -446,10 +465,10 @@ class RecorderThread(
                     container.release()
                 }
             } finally {
-                audioRecord.stop()
+                audioRecords.forEach(AudioRecord::stop)
             }
         } finally {
-            audioRecord.release()
+            audioRecords.forEach(AudioRecord::release)
         }
     }
 
@@ -457,77 +476,93 @@ class RecorderThread(
      * Main loop for encoding captured raw audio into an output file.
      *
      * The loop runs forever until [cancel] is called. At that point, no further data will be read
-     * from [audioRecord] and the remaining output data from [encoder] will be written to the output
-     * file. If [audioRecord] fails to capture data, the loop will behave as if [cancel] was called
-     * (ie. abort, but ensuring that the output file is valid).
+     * from any of the [audioRecords] and the remaining output data from [encoder] will be written
+     * to the output file. If any of the [audioRecords] fails to capture data, the loop will behave
+     * as if [cancel] was called (ie. abort, but ensuring that the output file is valid).
      *
      * The approximate amount of time to cancel reading from the audio source is the time it takes
      * to process the minimum buffer size. Additionally, additional time is needed to write out the
      * remaining encoded data to the output file.
      *
-     * @param audioRecord [AudioRecord.startRecording] must have been called
+     * @param audioRecords [AudioRecord.startRecording] must have been called on every instance
      * @param encoder [Encoder.start] must have been called
      * @param bufSize Size of buffer to use for each [AudioRecord.read] operation
      *
      * @throws Exception if the audio recorder or encoder encounters an error
      */
-    private fun encodeLoop(audioRecord: AudioRecord, encoder: Encoder, bufSize: Int) {
+    private fun encodeLoop(audioRecords: List<AudioRecord>, encoder: Encoder, bufSize: Int) {
         var numFrames = 0L
-        val frameSize = audioRecord.format.frameSizeInBytesCompat
+        val frameSize = BYTES_PER_SAMPLE * audioRecords.size
 
         // Use a slightly larger buffer to reduce the chance of problems under load
-        val buffer = ByteBuffer.allocateDirect(bufSize * 2)
-        val bufferFrames = buffer.capacity().toLong() / frameSize
-        val bufferNs = bufferFrames * 1_000_000_000L / audioRecord.sampleRate
+        val baseSize = bufSize * 2
 
-        while (!isCancelled) {
+        // Input buffers for each AudioRecord
+        val buffersIn = audioRecords.map { ByteBuffer.allocateDirect(baseSize) }
+        // Output buffer for interleaved channels
+        val bufferOut = ByteBuffer.allocateDirect(baseSize * audioRecords.size)
+        // Size of output buffer in frames
+        val bufferFrames = bufferOut.capacity().toLong() / frameSize
+        // Size of output buffer in nanoseconds
+        val bufferNs = bufferFrames * 1_000_000_000L / sampleRate.value.toInt()
+
+        outer@ while (!isCancelled) {
             val begin = System.nanoTime()
-            val n = audioRecord.read(buffer, buffer.remaining())
-            val recordElapsed = System.nanoTime() - begin
-            var encodeElapsed = 0L
 
-            if (n < 0) {
-                Log.e(tag, "Error when reading samples from $audioRecord: $n")
-                isCancelled = true
-                captureFailed = true
-            } else if (n == 0) {
-                Log.e(tag,  "Unexpected EOF from AudioRecord")
-                isCancelled = true
-            } else {
-                buffer.limit(n)
+            for ((audioRecord, buffer) in audioRecords.zip(buffersIn)) {
+                val nRead = audioRecord.read(buffer, buffer.remaining())
+                // An unexpected EOF is an error too
+                if (nRead <= 0) {
+                    Log.e(tag, "Failed to read from source ${audioRecord.audioSource}: $nRead")
+                    isCancelled = true
+                    captureFailed = true
+                    break@outer
+                }
 
-                val encodeBegin = System.nanoTime()
-                encoder.encode(buffer, false)
-                encodeElapsed = System.nanoTime() - encodeBegin
-
-                buffer.clear()
-
-                numFrames += n / frameSize
+                buffer.limit(nRead)
             }
+            val recordElapsed = System.nanoTime() - begin
+
+            val interleaveBegin = System.nanoTime()
+            val nWritten = interleaveChannels(buffersIn, bufferOut)
+            val interleaveElapsed = System.nanoTime() - interleaveBegin
+
+            val encodeBegin = System.nanoTime()
+            encoder.encode(bufferOut, false)
+            val encodeElapsed = System.nanoTime() - encodeBegin
+
+            // Move unused data in the input buffers to the beginning. Clear output buffer since it
+            // is guaranteed to have been fully written to the container.
+            buffersIn.forEach(ByteBuffer::compact)
+            bufferOut.clear()
+
+            numFrames += nWritten / frameSize
 
             val totalElapsed = System.nanoTime() - begin
             if (encodeElapsed > bufferNs) {
                 Log.w(tag, "${encoder.javaClass.simpleName} took too long: " +
-                        "timestamp=${numFrames.toDouble() / audioRecord.sampleRate}s, " +
+                        "timestamp=${numFrames.toDouble() / sampleRate.value.toDouble()}s, " +
                         "buffer=${bufferNs / 1_000_000.0}ms, " +
                         "total=${totalElapsed / 1_000_000.0}ms, " +
                         "record=${recordElapsed / 1_000_000.0}ms, " +
+                        "interleave=${interleaveElapsed / 1_000_000.0}ms, " +
                         "encode=${encodeElapsed / 1_000_000.0}ms")
             }
         }
 
         // Signal EOF with empty buffer
         Log.d(tag, "Sending EOF to encoder")
-        buffer.limit(buffer.position())
-        encoder.encode(buffer, true)
+        bufferOut.limit(bufferOut.position())
+        encoder.encode(bufferOut, true)
 
-        val durationSecs = numFrames.toDouble() / audioRecord.sampleRate
+        val durationSecs = numFrames.toDouble() / sampleRate.value.toDouble()
         Log.d(tag, "Input complete after ${"%.1f".format(durationSecs)}s")
     }
 
     companion object {
         private const val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
         private const val ENCODING = AudioFormat.ENCODING_PCM_16BIT
+        const val BYTES_PER_SAMPLE = 2
 
         // Eg. 20220429_180249.123-0400
         private val FORMATTER = DateTimeFormatterBuilder()
@@ -573,6 +608,43 @@ class RecorderThread(
             if (msg.length > 2 * n) {
                 append(msg.substring(msg.length - n))
             }
+        }
+
+        /**
+         * Read samples of size [BYTES_PER_SAMPLE] from [buffersIn] and write them to [bufferOut]
+         * interleaved.
+         *
+         * Only complete frames will be written to [bufferOut]. For example, if [buffersIn] has
+         * [2 samples remaining, 3 samples remaining], then only 2 frames are written to
+         * [bufferOut]. After the copy is complete, [bufferOut] will be flipped so that it is ready
+         * to be read from.
+         *
+         * @return The number of bytes written to [bufferOut].
+         */
+        private fun interleaveChannels(buffersIn: List<ByteBuffer>, bufferOut: ByteBuffer): Int {
+            val data = ByteArray(BYTES_PER_SAMPLE)
+            // Bytes copied per channel
+            var copied = 0
+
+            // Max bytes that can be copied per channel. Avoid unnecessary allocations with regular
+            // for loop.
+            var toCopy = bufferOut.remaining() / buffersIn.size
+            for (buffer in buffersIn) {
+                toCopy = min(toCopy, buffer.remaining())
+            }
+
+            while (toCopy - copied >= data.size) {
+                buffersIn.forEach {
+                    it.get(data)
+                    bufferOut.put(data)
+                }
+
+                copied += data.size
+            }
+
+            bufferOut.flip()
+
+            return copied * buffersIn.size
         }
     }
 
